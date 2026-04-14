@@ -629,6 +629,7 @@ async function loadData(){
       {projectId:6,name:'Inventario de documentos',owner:'Laura Vega',start:'2025-01-05',end:'2025-03-01',status:'completado',notes:''},
       {projectId:6,name:'Diseño de taxonomía',owner:'Sandra Ríos',start:'2025-03-01',end:'2025-05-01',status:'activo',notes:''},
     ];
+    autoRisk();
     renderAll();return;
   }
   try{
@@ -637,10 +638,65 @@ async function loadData(){
     // Normalizar fechas al cargar desde Sheets
     proyectos=(d.proyectos||[]).map(p=>({...p,start:normalizeDate(p.start),end:normalizeDate(p.end)}));
     subs=(d.subs||[]).map(s=>({...s,start:normalizeDate(s.start),end:normalizeDate(s.end)}));
+    autoRisk();
     renderAll();
   }catch(e){
     document.getElementById('proj-container').innerHTML='<div class="empty-st"><p>No se pudo conectar con Google Sheets.</p></div>';
   }
+}
+
+// ═══════════════════════════════════════════
+// AUTO-RIESGO
+// Se ejecuta cada vez que se cargan datos.
+// Modifica el estado en memoria (no en Sheets)
+// a menos que el proyecto ya esté "completado"
+// o "pausado" (esos estados se respetan).
+// ═══════════════════════════════════════════
+const RISK_DAYS_AHEAD = 7;   // días de anticipación para alerta
+const RISK_PROGRESS   = 70;  // % de progreso mínimo para no disparar alerta por proximidad
+
+function autoRisk(){
+  const todayMs = today.getTime();
+  proyectos.forEach(p=>{
+    // No tocar proyectos ya completados ni pausados
+    if(p.status==='completado'||p.status==='pausado') return;
+
+    let enRiesgo = false;
+    let razon = '';
+
+    // ── Regla 1: fecha límite ya pasó ──
+    if(p.end){
+      const endMs = new Date(p.end+'T23:59:59').getTime();
+      if(endMs < todayMs){
+        enRiesgo = true;
+        razon = 'vencido';
+      }
+    }
+
+    // ── Regla 2: próximo a vencer con poco progreso ──
+    if(!enRiesgo && p.end){
+      const endMs  = new Date(p.end+'T23:59:59').getTime();
+      const diffDays = (endMs - todayMs) / (1000*60*60*24);
+      if(diffDays >= 0 && diffDays <= RISK_DAYS_AHEAD && Number(p.progress||0) < RISK_PROGRESS){
+        enRiesgo = true;
+        razon = 'proximo';
+      }
+    }
+
+    // ── Regla 3: alguna subactividad está en riesgo ──
+    if(!enRiesgo){
+      const tieneSubRiesgo = subs.some(s=>s.projectId==p.id && s.status==='riesgo');
+      if(tieneSubRiesgo){
+        enRiesgo = true;
+        razon = 'sub';
+      }
+    }
+
+    if(enRiesgo){
+      p.status = 'riesgo';
+      p._riskReason = razon; // guardamos la razón para mostrarla en el tooltip
+    }
+  });
 }
 
 // ═══════════════════════════════════════════
@@ -755,7 +811,7 @@ function renderList(f){
           </div>
         </div>
         <div class="pright">
-          <span class="sbadge ${SC[p.status]||'s-pendiente'}">${SL[p.status]||p.status}</span>
+          <span class="sbadge ${SC[p.status]||'s-pendiente'}" title="${p.status==='riesgo'&&p._riskReason?({vencido:'⚠ Fecha límite vencida',proximo:`⚠ Vence en menos de ${RISK_DAYS_AHEAD} días con progreso bajo`,sub:'⚠ Tiene subactividades en riesgo'}[p._riskReason]||''):''}">${SL[p.status]||p.status}${p._riskReason?` ⚠`:''}</span>
           <div class="prog-col"><div class="prog-track"><div class="prog-fill ${fc}" style="width:${pct}%"></div></div><span class="pct">${pct}%</span></div>
           ${can('edit')?`<button class="btn-edit-sm" title="Editar" onclick="event.stopPropagation();editP(${p.id})"><svg width="14" height="14" fill="none" viewBox="0 0 24 24"><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>`:''}
           <svg class="pexp" id="ex-${p.id}" width="13" height="13" fill="none" viewBox="0 0 24 24"><path stroke="#b0b0b0" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="M9 18l6-6-6-6"/></svg>
@@ -902,7 +958,7 @@ async function saveProject(){
     await push('saveProject',data);
     showToast('Proyecto creado','success');
   }
-  closeM('pm');renderAll();
+  closeM('pm');autoRisk();renderAll();
 }
 async function delProject(){
   if(SESSION.rol!=='admin'){showToast('Solo el administrador puede eliminar proyectos','error');return;}
@@ -910,7 +966,7 @@ async function delProject(){
   proyectos=proyectos.filter(p=>p.id!=editPId);
   subs=subs.filter(s=>s.projectId!=editPId);
   await push('deleteProject',{id:editPId});
-  closeM('pm');showToast('Proyecto eliminado');renderAll();
+  closeM('pm');showToast('Proyecto eliminado');autoRisk();renderAll();
 }
 
 // ═══════════════════════════════════════════
@@ -953,13 +1009,13 @@ async function saveSub(){
   }else{
     subs.push(data);await push('saveSub',data);showToast('Subactividad creada','success');
   }
-  closeM('sm');applyFilters();
+  closeM('sm');autoRisk();applyFilters();
 }
 async function delSub(){
   if(SESSION.rol!=='admin'){showToast('Solo el administrador puede eliminar subactividades','error');return;}
   if(!confirm('¿Eliminar esta subactividad?'))return;
   subs.splice(editSIdx,1);
-  closeM('sm');showToast('Subactividad eliminada');applyFilters();
+  closeM('sm');showToast('Subactividad eliminada');autoRisk();applyFilters();
 }
 
 // ═══════════════════════════════════════════
